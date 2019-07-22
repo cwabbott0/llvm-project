@@ -487,16 +487,18 @@ bool SIInsertSkips::runOnMachineFunction(MachineFunction &MF) {
       case AMDGPU::SI_KILL_F32_COND_IMM_TERMINATOR:
       case AMDGPU::SI_KILL_I1_TERMINATOR:
         MadeChange = true;
-        kill(MI);
+        if (MI.getOperand(MI.getNumOperands() - 1).getImm() == 0) {
+          kill(MI);
 
-        if (ExecBranchStack.empty()) {
-          if (NextBB != BE && skipIfDead(MI, *NextBB)) {
-            HaveSkipBlock = true;
-            NextBB = std::next(BI);
-            BE = MF.end();
+          if (ExecBranchStack.empty()) {
+            if (NextBB != BE && skipIfDead(MI, *NextBB)) {
+              HaveSkipBlock = true;
+              NextBB = std::next(BI);
+              BE = MF.end();
+            }
+          } else {
+            HaveKill = true;
           }
-        } else {
-          HaveKill = true;
         }
 
         MI.eraseFromParent();

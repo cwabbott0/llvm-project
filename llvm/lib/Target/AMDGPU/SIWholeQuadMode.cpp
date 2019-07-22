@@ -73,6 +73,7 @@
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineOperand.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/CodeGen/MachineSSAUpdater.h"
 #include "llvm/CodeGen/SlotIndexes.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/IR/CallingConv.h"
@@ -143,6 +144,50 @@ struct WorkItem {
   WorkItem(MachineInstr *MI) : MI(MI) {}
 };
 
+class LiveMaskBuilder {
+public:
+  LiveMaskBuilder(MachineFunction &MF)
+    : SSA(MF, &InsertedPHIs), MF(MF), InitialReg(0), Demoted(false) {}
+
+  void AddInitialValue(unsigned Reg) {
+    assert(InitialReg == 0);
+    assert(!Demoted);
+    InitialReg = Reg;
+  }
+
+  void AddDemotedValue(MachineBasicBlock *MBB, unsigned Reg) {
+    if (!Demoted) {
+      SSA.Initialize(InitialReg);
+      SSA.AddAvailableValue(&MF.front(), InitialReg);
+    }
+    SSA.AddAvailableValue(MBB, Reg);
+    Demoted = true;
+  }
+
+  unsigned GetValueForBlock(MachineBasicBlock *MBB) {
+    if (!Demoted || MBB == &MF.front()) {
+      assert(InitialReg != 0);
+      return InitialReg;
+    }
+
+    return SSA.GetValueInMiddleOfBlock(MBB);
+  }
+
+  bool IsDemoted() { return Demoted; }
+
+  void InsertPhiInstrsInMaps(LiveIntervals *LIS) {
+    for (MachineInstr *Phi : InsertedPHIs)
+      LIS->InsertMachineInstrInMaps(*Phi);
+  }
+
+private:
+  SmallVector<MachineInstr *, 4> InsertedPHIs;
+  MachineSSAUpdater SSA;
+  MachineFunction &MF;
+  unsigned InitialReg;
+  bool Demoted;
+};
+
 class SIWholeQuadMode : public MachineFunctionPass {
 private:
   CallingConv::ID CallingConv;
@@ -156,6 +201,7 @@ private:
   DenseMap<MachineBasicBlock *, BlockInfo> Blocks;
   SmallVector<MachineInstr *, 1> LiveMaskQueries;
   SmallVector<MachineInstr *, 4> LowerToCopyInstrs;
+  SmallVector<MachineInstr *, 4> Exports;
 
   void printInfo();
 
@@ -167,6 +213,8 @@ private:
   void propagateInstruction(MachineInstr &MI, std::vector<WorkItem> &Worklist);
   void propagateBlock(MachineBasicBlock &MBB, std::vector<WorkItem> &Worklist);
   char analyzeFunction(MachineFunction &MF);
+
+  bool analyzeDemotes(MachineFunction &MF, char &GlobalFlags);
 
   bool requiresCorrectState(const MachineInstr &MI) const;
 
@@ -186,7 +234,7 @@ private:
                unsigned SavedOrig);
   void processBlock(MachineBasicBlock &MBB, unsigned LiveMaskReg, bool isEntry);
 
-  void lowerLiveMaskQueries(unsigned LiveMaskReg);
+  void lowerLiveMaskQueries(MachineFunction &MF, LiveMaskBuilder &LiveMask);
   void lowerCopyInstrs();
 
 public:
@@ -379,6 +427,8 @@ char SIWholeQuadMode::scanInstructions(MachineFunction &MF,
         GlobalFlags |= StateExact;
         III.Disabled = StateWQM | StateWWM;
         continue;
+      } else if (TII->isEXP(MI)) {
+        Exports.push_back(&MI);
       } else {
         if (Opcode == AMDGPU::SI_PS_LIVE) {
           LiveMaskQueries.push_back(&MI);
@@ -837,10 +887,224 @@ void SIWholeQuadMode::processBlock(MachineBasicBlock &MBB, unsigned LiveMaskReg,
   }
 }
 
-void SIWholeQuadMode::lowerLiveMaskQueries(unsigned LiveMaskReg) {
+bool SIWholeQuadMode::analyzeDemotes(MachineFunction &MF, char &GlobalFlags)
+{
+  std::vector<WorkItem> Worklist;
+
+  bool Progress = false;
+  bool AnyDemotes = false;
+
+  // Turn any demote instructions where the remaining instructions don't use
+  // WQM into a regular kill. This is necessary, not just an optimization,
+  // since if WQM is not necessary we might exit in Exact mode, where we'd have
+  // to remove demoted threads from EXEC anyways.
+  for (MachineBasicBlock &MBB : MF) {
+    if (MBB.empty())
+      continue;
+
+    MachineInstr &Kill = MBB.back();
+    if (Kill.getOpcode() != AMDGPU::SI_KILL_I1_TERMINATOR &&
+        Kill.getOpcode() != AMDGPU::SI_KILL_F32_COND_IMM_TERMINATOR)
+      continue;
+
+    // check the demote operand
+    if (Kill.getOperand(Kill.getNumExplicitOperands() - 1).getImm() == 0)
+      continue;
+
+    BlockInfo &BBI = Blocks[&MBB];
+
+    if (!(BBI.OutNeeds & StateWQM)) {
+      // This is a demote instruction where no further instructions require WQM.
+      // We can turn it into a regular kill.
+      Kill.getOperand(Kill.getNumExplicitOperands() - 1).setImm(0);
+      Progress = true;
+    } else {
+      AnyDemotes = true;
+    }
+  }
+
+  if (AnyDemotes) {
+    // If there are any remaining demote instructions, then exports have to be
+    // exact so that demoted threads are not exported.
+    for (MachineInstr *MI : Exports) {
+      MachineBasicBlock *MBB = MI->getParent();
+      InstrInfo *III = &Instructions[MI];
+      BlockInfo *BBI = &Blocks[MBB];
+      III->Disabled = StateWQM | StateWWM;
+      BBI->Needs |= StateExact;
+      if (!(BBI->InNeeds & StateExact)) {
+        BBI->InNeeds |= StateExact;
+        Worklist.push_back(MBB);
+      }
+    }
+    GlobalFlags |= StateExact;
+
+    // We may need to re-propagate the new Exact flag across basic blocks.
+    while (!Worklist.empty()) {
+      WorkItem WI = Worklist.back();
+      Worklist.pop_back();
+
+      if (WI.MI)
+        propagateInstruction(*WI.MI, Worklist);
+      else
+        propagateBlock(*WI.MBB, Worklist);
+    }
+  }
+
+  return Progress;
+}
+
+void SIWholeQuadMode::lowerLiveMaskQueries(MachineFunction &MF,
+                                           LiveMaskBuilder &LiveMask) {
+  SmallVector<MachineInstr *, 4> LiveMaskReads;
+  for (MachineBasicBlock &MBB : MF) {
+    if (MBB.empty())
+      continue;
+
+    MachineInstr &Kill = MBB.back();
+    if (Kill.getOpcode() != AMDGPU::SI_KILL_I1_TERMINATOR &&
+        Kill.getOpcode() != AMDGPU::SI_KILL_F32_COND_IMM_TERMINATOR)
+      continue;
+
+    // check the demote operand
+    if (Kill.getOperand(Kill.getNumExplicitOperands() - 1).getImm() == 0)
+      continue;
+
+    const DebugLoc &DL = Kill.getDebugLoc();
+    unsigned Killed;
+    if (Kill.getOpcode() == AMDGPU::SI_KILL_I1_TERMINATOR) {
+      unsigned Exec = ST->isWave32() ? AMDGPU::EXEC_LO : AMDGPU::EXEC;
+      const MachineOperand &Op = Kill.getOperand(0);
+      int64_t KillVal = Kill.getOperand(1).getImm();
+      assert(KillVal == 0 || KillVal == -1);
+
+      // Kill all threads if Op0 is an immediate and equal to the Kill value.
+      if (Op.isImm()) {
+        int64_t Imm = Op.getImm();
+        assert(Imm == 0 || Imm == -1);
+
+        if (Imm == KillVal)
+          Killed = Exec;
+        else
+          continue;
+      } else {
+        // We can't assume anything about the bits where EXEC = 0, so we
+        // compute killed = EXEC & (~)condition here to zero out those bits.
+        Killed = MRI->createVirtualRegister(ST->isWave32() ? &AMDGPU::SReg_32RegClass
+                                                           : &AMDGPU::SReg_64RegClass);
+        unsigned Opcode = KillVal ? AMDGPU::S_AND_B64 : AMDGPU::S_ANDN2_B64;
+        if (ST->isWave32())
+          Opcode = KillVal ? AMDGPU::S_AND_B32 : AMDGPU::S_ANDN2_B32;
+        MachineInstr *MI = BuildMI(MBB, &Kill, DL, TII->get(Opcode), Killed)
+            .addReg(Exec)
+            .add(Op);
+        LIS->InsertMachineInstrInMaps(*MI);
+      }
+    } else {
+      // We need to lower to an actual comparison instruction, since we can't
+      // use the CMPX instructions that are normally used for non-demote
+      // kills. The opcodes are inverted because the inline immediate has to
+      // be the first operand, e.g. from "x < imm" to "imm > x". In addition
+      // the result has to be negated since, unlike the CMPX variant, we have
+      // to get a bitset of the threads killed instead of threads still
+      // alive, so that still-alive threads get the same value as threads not
+      // currently active (i.e. with EXEC=0).
+      unsigned Opcode;
+      switch (Kill.getOperand(2).getImm()) {
+      case ISD::SETOEQ:
+      case ISD::SETEQ:
+        Opcode = AMDGPU::V_CMP_NEQ_F32_e64;
+        break;
+      case ISD::SETOGT:
+      case ISD::SETGT:
+        Opcode = AMDGPU::V_CMP_NLT_F32_e64;
+        break;
+      case ISD::SETOGE:
+      case ISD::SETGE:
+        Opcode = AMDGPU::V_CMP_NLE_F32_e64;
+        break;
+      case ISD::SETOLT:
+      case ISD::SETLT:
+        Opcode = AMDGPU::V_CMP_NGT_F32_e64;
+        break;
+      case ISD::SETOLE:
+      case ISD::SETLE:
+        Opcode = AMDGPU::V_CMP_NGE_F32_e64;
+        break;
+      case ISD::SETONE:
+      case ISD::SETNE:
+        Opcode = AMDGPU::V_CMP_NLG_F32_e64;
+        break;
+      case ISD::SETO:
+        Opcode = AMDGPU::V_CMP_U_F32_e64;
+        break;
+      case ISD::SETUO:
+        Opcode = AMDGPU::V_CMP_O_F32_e64;
+        break;
+      case ISD::SETUEQ:
+        Opcode = AMDGPU::V_CMP_LG_F32_e64;
+        break;
+      case ISD::SETUGT:
+        Opcode = AMDGPU::V_CMP_GE_F32_e64;
+        break;
+      case ISD::SETUGE:
+        Opcode = AMDGPU::V_CMP_GT_F32_e64;
+        break;
+      case ISD::SETULT:
+        Opcode = AMDGPU::V_CMP_LE_F32_e64;
+        break;
+      case ISD::SETULE:
+        Opcode = AMDGPU::V_CMP_LT_F32_e64;
+        break;
+      case ISD::SETUNE:
+        Opcode = AMDGPU::V_CMP_EQ_F32_e64;
+        break;
+      default:
+        llvm_unreachable("invalid ISD:SET cond code");
+      }
+      Killed = ST->isWave32() ? AMDGPU::VCC_LO : AMDGPU::VCC;
+      if (TRI->isVGPR(MBB.getParent()->getRegInfo(),
+                      Kill.getOperand(0).getReg())) {
+        Opcode = AMDGPU::getVOPe32(Opcode);
+        MachineInstr *MI = BuildMI(MBB, &Kill, DL, TII->get(Opcode))
+            .add(Kill.getOperand(1))
+            .add(Kill.getOperand(0));
+        LIS->InsertMachineInstrInMaps(*MI);
+      } else {
+        MachineInstr *MI = BuildMI(MBB, &Kill, DL, TII->get(Opcode))
+          .addImm(0)  // src0 modifiers
+          .add(Kill.getOperand(1))
+          .addImm(0)  // src1 modifiers
+          .add(Kill.getOperand(0))
+          .addImm(0);  // omod
+        LIS->InsertMachineInstrInMaps(*MI);
+      }
+    }
+
+    unsigned NewLiveMask =
+      MRI->createVirtualRegister(ST->getBoolRC());
+    // We can't actually correctly figure out the old live mask until we've
+    // gone through all the demotes, since we might demote inside a loop. Use
+    // a dummy source, stash the instruction, and rewrite it below.
+    unsigned Opcode = ST->isWave32() ? AMDGPU::S_ANDN2_B32 : AMDGPU::S_ANDN2_B64;
+    MachineInstr *MI = BuildMI(MBB, &Kill, DL, TII->get(Opcode), NewLiveMask)
+      .addReg(NewLiveMask) // LiveMask before
+      .addReg(Killed);
+    LIS->InsertMachineInstrInMaps(*MI);
+    LiveMaskReads.push_back(MI);
+
+    LiveMask.AddDemotedValue(&MBB, NewLiveMask);
+  }
+
+  for (MachineInstr *MI : LiveMaskReads) {
+    MI->getOperand(1).setReg(LiveMask.GetValueForBlock(MI->getParent()));
+  }
+
   for (MachineInstr *MI : LiveMaskQueries) {
     const DebugLoc &DL = MI->getDebugLoc();
     unsigned Dest = MI->getOperand(0).getReg();
+    unsigned LiveMaskReg = LiveMask.GetValueForBlock(MI->getParent());
+
     MachineInstr *Copy =
         BuildMI(*MI->getParent(), MI, DL, TII->get(AMDGPU::COPY), Dest)
             .addReg(LiveMaskReg);
@@ -875,11 +1139,14 @@ void SIWholeQuadMode::lowerCopyInstrs() {
 }
 
 bool SIWholeQuadMode::runOnMachineFunction(MachineFunction &MF) {
+  bool Progress = false;
   Instructions.clear();
   Blocks.clear();
   LiveMaskQueries.clear();
   LowerToCopyInstrs.clear();
+  Exports.clear();
   CallingConv = MF.getFunction().getCallingConv();
+  LiveMaskBuilder LiveMask(MF);
 
   ST = &MF.getSubtarget<GCNSubtarget>();
 
@@ -889,26 +1156,29 @@ bool SIWholeQuadMode::runOnMachineFunction(MachineFunction &MF) {
   LIS = &getAnalysis<LiveIntervals>();
 
   char GlobalFlags = analyzeFunction(MF);
-  unsigned LiveMaskReg = 0;
+  Progress |= analyzeDemotes(MF, GlobalFlags);
   unsigned Exec = ST->isWave32() ? AMDGPU::EXEC_LO : AMDGPU::EXEC;
   if (!(GlobalFlags & StateWQM)) {
-    lowerLiveMaskQueries(Exec);
+    LiveMask.AddInitialValue(Exec);
+    lowerLiveMaskQueries(MF, LiveMask);
     if (!(GlobalFlags & StateWWM) && LowerToCopyInstrs.empty())
-      return !LiveMaskQueries.empty();
+      return Progress || !LiveMaskQueries.empty();
   } else {
     // Store a copy of the original live mask when required
     MachineBasicBlock &Entry = MF.front();
     MachineBasicBlock::iterator EntryMI = Entry.getFirstNonPHI();
 
+    unsigned EntryLiveMaskReg = 0;
     if (GlobalFlags & StateExact || !LiveMaskQueries.empty()) {
-      LiveMaskReg = MRI->createVirtualRegister(TRI->getBoolRC());
+      EntryLiveMaskReg = MRI->createVirtualRegister(TRI->getBoolRC());
       MachineInstr *MI = BuildMI(Entry, EntryMI, DebugLoc(),
-                                 TII->get(AMDGPU::COPY), LiveMaskReg)
+                                 TII->get(AMDGPU::COPY), EntryLiveMaskReg)
                              .addReg(Exec);
       LIS->InsertMachineInstrInMaps(*MI);
     }
 
-    lowerLiveMaskQueries(LiveMaskReg);
+    LiveMask.AddInitialValue(EntryLiveMaskReg);
+    lowerLiveMaskQueries(MF, LiveMask);
 
     if (GlobalFlags == StateWQM) {
       // For a shader that needs only WQM, we can just set it once.
@@ -928,8 +1198,12 @@ bool SIWholeQuadMode::runOnMachineFunction(MachineFunction &MF) {
   lowerCopyInstrs();
 
   // Handle the general case
-  for (auto BII : Blocks)
-    processBlock(*BII.first, LiveMaskReg, BII.first == &*MF.begin());
+  for (auto BII : Blocks) {
+    processBlock(*BII.first, LiveMask.GetValueForBlock(BII.first),
+                 BII.first == &*MF.begin());
+  }
+
+  LiveMask.InsertPhiInstrsInMaps(LIS);
 
   // Physical registers like SCC aren't tracked by default anyway, so just
   // removing the ranges we computed is the simplest option for maintaining

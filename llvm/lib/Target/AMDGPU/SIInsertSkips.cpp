@@ -18,6 +18,7 @@
 #include "SIInstrInfo.h"
 #include "SIMachineFunctionInfo.h"
 #include "MCTargetDesc/AMDGPUMCTargetDesc.h"
+#include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
@@ -438,13 +439,9 @@ bool SIInsertSkips::runOnMachineFunction(MachineFunction &MF) {
   // Track depth of exec mask, divergent branches.
   SmallVector<MachineBasicBlock *, 16> ExecBranchStack;
 
-  MachineFunction::iterator NextBB;
-
   MachineBasicBlock *EmptyMBBAtEnd = nullptr;
 
-  for (MachineFunction::iterator BI = MF.begin(), BE = MF.end();
-       BI != BE; BI = NextBB) {
-    NextBB = std::next(BI);
+  for (MachineBasicBlock *BI : ReversePostOrderTraversal<MachineFunction *>(&MF)) {
     MachineBasicBlock &MBB = *BI;
     bool HaveSkipBlock = false;
 
@@ -487,14 +484,14 @@ bool SIInsertSkips::runOnMachineFunction(MachineFunction &MF) {
       case AMDGPU::SI_KILL_F32_COND_IMM_TERMINATOR:
       case AMDGPU::SI_KILL_I1_TERMINATOR:
         MadeChange = true;
-        if (MI.getOperand(MI.getNumOperands() - 1).getImm() == 0) {
+        if (MI.getOperand(MI.getNumExplicitOperands() - 1).getImm() == 0) {
           kill(MI);
 
           if (ExecBranchStack.empty()) {
-            if (NextBB != BE && skipIfDead(MI, *NextBB)) {
-              HaveSkipBlock = true;
-              NextBB = std::next(BI);
-              BE = MF.end();
+            if (MachineBasicBlock *NextBB = MBB.getFallThrough()) {
+              if (skipIfDead(MI, *NextBB)) {
+                HaveSkipBlock = true;
+              }
             }
           } else {
             HaveKill = true;
@@ -510,7 +507,7 @@ bool SIInsertSkips::runOnMachineFunction(MachineFunction &MF) {
 
         // Graphics shaders returning non-void shouldn't contain S_ENDPGM,
         // because external bytecode will be appended at the end.
-        if (BI != --MF.end() || I != MBB.getFirstTerminator()) {
+        if (BI != &MF.back() || I != MBB.getFirstTerminator()) {
           // SI_RETURN_TO_EPILOG is not the last instruction. Add an empty block at
           // the end and jump there.
           if (!EmptyMBBAtEnd) {
